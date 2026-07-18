@@ -24,19 +24,64 @@ enum AutofillFailure: LocalizedError {
 }
 
 final class BrowserAutofill {
+    struct WindowIdentity: Hashable {
+        let processIdentifier: pid_t
+        let windowNumber: CGWindowID
+    }
+
+    struct Candidate {
+        let identity: WindowIdentity
+        let application: NSRunningApplication
+    }
+
     struct Target {
+        let identity: WindowIdentity
         let application: NSRunningApplication
         let window: AXUIElement
         let fields: [AccessibilityNode]
     }
 
-    func locateTarget(policy: ApplicationRulePolicy) throws -> Target {
-        let runningApplications = eligibleApplications(policy: policy)
-        guard !runningApplications.isEmpty else {
+    func authorizationWindowCandidates(policy: ApplicationRulePolicy) -> [Candidate] {
+        let applications = eligibleApplicationsByPID(policy: policy)
+        guard !applications.isEmpty else { return [] }
+
+        let windowInfo = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] ?? []
+
+        var candidates: [Candidate] = []
+        var seen = Set<WindowIdentity>()
+        for info in windowInfo {
+            let title = info[kCGWindowName as String] as? String
+            guard AuthorizationContext.isICloudPasswordWindowTitle(title),
+                  let rawPID = info[kCGWindowOwnerPID as String] as? NSNumber,
+                  let rawWindowNumber = info[kCGWindowNumber as String] as? NSNumber else {
+                continue
+            }
+            let identity = WindowIdentity(
+                processIdentifier: rawPID.int32Value,
+                windowNumber: CGWindowID(rawWindowNumber.uint32Value)
+            )
+            guard !seen.contains(identity),
+                  let application = applications[identity.processIdentifier] else {
+                continue
+            }
+            seen.insert(identity)
+            candidates.append(Candidate(identity: identity, application: application))
+            if candidates.count == 4 { break }
+        }
+        return candidates
+    }
+
+    func locateTarget(candidates: [Candidate]) throws -> Target {
+        guard !candidates.isEmpty else {
             throw AutofillFailure.noEligibleApplicationRunning
         }
 
-        for application in runningApplications {
+        let groupedCandidates = Dictionary(grouping: candidates, by: { $0.application.processIdentifier })
+        for (_, applicationCandidates) in groupedCandidates {
+            guard let application = applicationCandidates.first?.application else { continue }
             let accessibilityApplication = AXUIElementCreateApplication(application.processIdentifier)
             AccessibilityTree.enableEnhancedUserInterface(accessibilityApplication)
 
@@ -57,7 +102,12 @@ final class BrowserAutofill {
                 )
                 guard hasStablePopupSignature || hasAuthorizationContext else { continue }
                 guard !fields.isEmpty else { throw AutofillFailure.inputNotFound }
-                return Target(application: application, window: window, fields: fields)
+                return Target(
+                    identity: applicationCandidates[0].identity,
+                    application: application,
+                    window: window,
+                    fields: fields
+                )
             }
         }
         throw AutofillFailure.authorizationWindowNotFound
@@ -89,9 +139,21 @@ final class BrowserAutofill {
         }
     }
 
-    private func eligibleApplications(policy: ApplicationRulePolicy) -> [NSRunningApplication] {
+    private func eligibleApplicationsByPID(
+        policy: ApplicationRulePolicy
+    ) -> [pid_t: NSRunningApplication] {
         var unique: [String: NSRunningApplication] = [:]
-        for application in NSWorkspace.shared.runningApplications {
+        let runningApplications: [NSRunningApplication]
+        switch policy.mode {
+        case .allowlist:
+            runningApplications = policy.allowlist.flatMap {
+                NSRunningApplication.runningApplications(withBundleIdentifier: $0)
+            }
+        case .denylist:
+            runningApplications = NSWorkspace.shared.runningApplications
+        }
+
+        for application in runningApplications {
             guard application.activationPolicy == .regular,
                   let bundleIdentifier = application.bundleIdentifier,
                   policy.permits(bundleIdentifier: bundleIdentifier),
@@ -101,27 +163,10 @@ final class BrowserAutofill {
             unique[bundleIdentifier] = application
         }
 
-        let applicationsByPID = Dictionary(
+        return Dictionary(
             unique.values.map { ($0.processIdentifier, $0) },
             uniquingKeysWith: { first, _ in first }
         )
-        let windowInfo = CGWindowListCopyWindowInfo(
-            [.optionOnScreenOnly, .excludeDesktopElements],
-            kCGNullWindowID
-        ) as? [[String: Any]] ?? []
-        var ordered: [NSRunningApplication] = []
-        var seen = Set<pid_t>()
-        for info in windowInfo {
-            let title = info[kCGWindowName as String] as? String
-            guard AuthorizationContext.isICloudPasswordWindowTitle(title) else { continue }
-            guard let rawPID = info[kCGWindowOwnerPID as String] as? NSNumber else { continue }
-            let pid = rawPID.int32Value
-            guard !seen.contains(pid), let application = applicationsByPID[pid] else { continue }
-            seen.insert(pid)
-            ordered.append(application)
-            if ordered.count == 4 { break }
-        }
-        return ordered
     }
 
     private func postDigit(_ digit: Character, processIdentifier: pid_t) throws {

@@ -155,6 +155,7 @@ private struct BridgeMenu: View {
         }
         .padding(16)
         .frame(width: 340)
+        .onAppear(perform: model.refreshPermissionStatus)
     }
 }
 

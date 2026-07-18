@@ -40,11 +40,13 @@ final class BridgeModel: ObservableObject {
 
     private let codeReader = PasswordCodeReader()
     private let browserAutofill = BrowserAutofill()
-    private var timer: Timer?
+    private var scanTimer: Timer?
     private var hotKey: GlobalHotKey?
     private var currentCode: CapturedCode?
     private var lastSuccessfulCode: String?
-    private var lastVisionAttempt = Date.distantPast
+    private var handledWindows = Set<BrowserAutofill.WindowIdentity>()
+    private var retryAfter: [BrowserAutofill.WindowIdentity: Date] = [:]
+    private var failedAttempts: [BrowserAutofill.WindowIdentity: Int] = [:]
     private var scanInProgress = false
     private var manualRequestPending = false
     private var started = false
@@ -100,15 +102,15 @@ final class BridgeModel: ObservableObject {
         let hotKeyReady = hotKey?.start() == true
         statusText = hotKeyReady ? "等待 Apple 密码授权窗口" : "快捷键注册失败"
 
-        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+        scanTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.refreshPermissions()
                 if self.monitoringEnabled && self.automaticFillEnabled {
                     await self.scanAndFill(manual: false)
                 }
             }
         }
+        scanTimer?.tolerance = 0.15
     }
 
     func fillNow() async {
@@ -126,6 +128,10 @@ final class BridgeModel: ObservableObject {
         statusText = screenRecordingGranted
             ? "录屏权限已允许"
             : "请在系统设置中允许屏幕与系统录音权限"
+    }
+
+    func refreshPermissionStatus() {
+        refreshPermissions()
     }
 
     func openAccessibilitySettings() {
@@ -191,11 +197,27 @@ final class BridgeModel: ObservableObject {
             return
         }
 
+        let allCandidates = browserAutofill.authorizationWindowCandidates(policy: applicationPolicy)
+        let visibleIdentities = Set(allCandidates.map(\.identity))
+        handledWindows.formIntersection(visibleIdentities)
+        retryAfter = retryAfter.filter { visibleIdentities.contains($0.key) }
+        failedAttempts = failedAttempts.filter { visibleIdentities.contains($0.key) }
+
+        let now = Date()
+        let candidates = manual ? allCandidates : allCandidates.filter {
+            !handledWindows.contains($0.identity)
+                && (retryAfter[$0.identity] ?? .distantPast) <= now
+        }
+        guard !candidates.isEmpty else {
+            if manual { statusText = AutofillFailure.authorizationWindowNotFound.localizedDescription }
+            return
+        }
+
         scanInProgress = true
-        isWorking = true
+        if manual { setWorking(true) }
         defer {
             scanInProgress = false
-            isWorking = false
+            if manual { setWorking(false) }
             if manualRequestPending {
                 manualRequestPending = false
                 Task { @MainActor [weak self] in
@@ -206,8 +228,9 @@ final class BridgeModel: ObservableObject {
 
         let target: BrowserAutofill.Target
         do {
-            target = try browserAutofill.locateTarget(policy: applicationPolicy)
+            target = try browserAutofill.locateTarget(candidates: candidates)
         } catch {
+            scheduleRetry(for: candidates.map(\.identity))
             if manual { statusText = error.localizedDescription }
             return
         }
@@ -215,9 +238,7 @@ final class BridgeModel: ObservableObject {
         var captured = codeReader.readUsingAccessibility()
         if captured == nil,
            ocrFallbackEnabled,
-           screenRecordingGranted,
-           manual || Date().timeIntervalSince(lastVisionAttempt) >= 0.25 {
-            lastVisionAttempt = Date()
+           screenRecordingGranted {
             captured = await codeReader.readUsingVision()
         }
 
@@ -226,25 +247,58 @@ final class BridgeModel: ObservableObject {
         }
         guard let code = currentCode, code.isFresh() else {
             currentCode = nil
+            scheduleRetry(for: [target.identity])
             if manual { statusText = "未发现有效的 Apple 密码验证码窗口" }
             return
         }
-        guard manual || code.value != lastSuccessfulCode else { return }
+        guard manual || code.value != lastSuccessfulCode else {
+            markHandled(target.identity)
+            return
+        }
 
         do {
             statusText = "已识别验证码，正在激活 \(target.application.localizedName ?? "目标应用")"
             try await browserAutofill.fill(code: code.value, target: target, speed: fillSpeed)
             lastSuccessfulCode = code.value
             currentCode = nil
+            markHandled(target.identity)
             statusText = "已填入 \(target.application.localizedName ?? "目标应用")（\(code.source.rawValue)）"
         } catch {
+            scheduleRetry(for: [target.identity])
             statusText = error.localizedDescription
         }
     }
 
+    private func scheduleRetry(for identities: [BrowserAutofill.WindowIdentity]) {
+        let now = Date()
+        for identity in identities {
+            let attempt = min((failedAttempts[identity] ?? 0) + 1, 7)
+            failedAttempts[identity] = attempt
+            let delay = min(0.35 * pow(2, Double(attempt - 1)), 15)
+            retryAfter[identity] = now.addingTimeInterval(delay)
+        }
+    }
+
+    private func markHandled(_ identity: BrowserAutofill.WindowIdentity) {
+        handledWindows.insert(identity)
+        retryAfter.removeValue(forKey: identity)
+        failedAttempts.removeValue(forKey: identity)
+    }
+
+    private func setWorking(_ value: Bool) {
+        guard isWorking != value else { return }
+        isWorking = value
+    }
+
     private func refreshPermissions() {
-        accessibilityGranted = PermissionManager.accessibilityGranted
-        screenRecordingGranted = PermissionManager.screenRecordingGranted
+        let newAccessibilityGranted = PermissionManager.accessibilityGranted
+        let newScreenRecordingGranted = PermissionManager.screenRecordingGranted
+        if accessibilityGranted != newAccessibilityGranted {
+            accessibilityGranted = newAccessibilityGranted
+        }
+        if screenRecordingGranted != newScreenRecordingGranted {
+            screenRecordingGranted = newScreenRecordingGranted
+        }
     }
 
     private func refreshLaunchAtLogin() {

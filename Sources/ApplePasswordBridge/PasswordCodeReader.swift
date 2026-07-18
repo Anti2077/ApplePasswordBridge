@@ -88,15 +88,17 @@ final class PasswordCodeReader {
     }
 
     private func recognizeText(in image: CGImage) throws -> String {
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .fast
-        request.recognitionLanguages = ["en-US"]
-        request.usesLanguageCorrection = false
+        try autoreleasepool {
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .fast
+            request.recognitionLanguages = ["en-US"]
+            request.usesLanguageCorrection = false
 
-        try VNImageRequestHandler(cgImage: image).perform([request])
-        return (request.results ?? [])
-            .compactMap { $0.topCandidates(1).first?.string }
-            .joined(separator: "\n")
+            try VNImageRequestHandler(cgImage: image).perform([request])
+            return (request.results ?? [])
+                .compactMap { $0.topCandidates(1).first?.string }
+                .joined(separator: "\n")
+        }
     }
 
     private func displayScale(for frame: CGRect) -> CGFloat {
