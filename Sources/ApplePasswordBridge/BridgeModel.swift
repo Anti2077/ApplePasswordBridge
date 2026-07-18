@@ -101,7 +101,7 @@ final class BridgeModel: ObservableObject {
         statusText = hotKeyReady ? "等待 Apple 密码授权窗口" : "快捷键注册失败"
 
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.refreshPermissions()
                 if self.monitoringEnabled && self.automaticFillEnabled {
