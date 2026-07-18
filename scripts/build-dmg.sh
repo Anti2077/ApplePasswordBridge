@@ -30,8 +30,9 @@ build_arch arm64
 build_arch x86_64
 
 rm -rf "$BUILD_ROOT/stage" "$BUILD_ROOT/dmg" "$DMG"
-mkdir -p "$STAGE/Contents/MacOS" "$DMG_ROOT"
+mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources" "$DMG_ROOT"
 cp "$INFO_PLIST" "$STAGE/Contents/Info.plist"
+cp "$ROOT/Resources/AppIcon.icns" "$STAGE/Contents/Resources/AppIcon.icns"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$STAGE/Contents/Info.plist"
 
 lipo -create \
