@@ -1,4 +1,4 @@
-.PHONY: build test app run clean
+.PHONY: build test app dmg run clean
 
 DEVELOPER_DIR ?= /Applications/Xcode.app/Contents/Developer
 
@@ -10,6 +10,9 @@ test:
 
 app:
 	DEVELOPER_DIR=$(DEVELOPER_DIR) ./scripts/build-app.sh
+
+dmg:
+	DEVELOPER_DIR=$(DEVELOPER_DIR) ./scripts/build-dmg.sh
 
 run: app
 	open "dist/Password Bridge.app"
