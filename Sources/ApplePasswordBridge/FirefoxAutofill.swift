@@ -74,6 +74,18 @@ final class BrowserAutofill {
         return candidates
     }
 
+    func prepareAccessibility(for candidates: [Candidate]) {
+        var preparedProcesses = Set<pid_t>()
+        for candidate in candidates where preparedProcesses.insert(
+            candidate.application.processIdentifier
+        ).inserted {
+            let application = AXUIElementCreateApplication(
+                candidate.application.processIdentifier
+            )
+            AccessibilityTree.enableEnhancedUserInterface(application)
+        }
+    }
+
     func locateTarget(candidates: [Candidate]) throws -> Target {
         guard !candidates.isEmpty else {
             throw AutofillFailure.noEligibleApplicationRunning

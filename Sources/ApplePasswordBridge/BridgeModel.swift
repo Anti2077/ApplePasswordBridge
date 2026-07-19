@@ -43,8 +43,8 @@ final class BridgeModel: ObservableObject {
     private var scanTimer: Timer?
     private var hotKey: GlobalHotKey?
     private var currentCode: CapturedCode?
-    private var lastSuccessfulCode: String?
-    private var handledWindows = Set<BrowserAutofill.WindowIdentity>()
+    private var lastSuccessfulCode: CapturedCode?
+    private var handledWindows: [BrowserAutofill.WindowIdentity: Date] = [:]
     private var retryAfter: [BrowserAutofill.WindowIdentity: Date] = [:]
     private var failedAttempts: [BrowserAutofill.WindowIdentity: Int] = [:]
     private var scanInProgress = false
@@ -199,13 +199,15 @@ final class BridgeModel: ObservableObject {
 
         let allCandidates = browserAutofill.authorizationWindowCandidates(policy: applicationPolicy)
         let visibleIdentities = Set(allCandidates.map(\.identity))
-        handledWindows.formIntersection(visibleIdentities)
+        let now = Date()
+        handledWindows = handledWindows.filter {
+            visibleIdentities.contains($0.key) && now.timeIntervalSince($0.value) < 10
+        }
         retryAfter = retryAfter.filter { visibleIdentities.contains($0.key) }
         failedAttempts = failedAttempts.filter { visibleIdentities.contains($0.key) }
 
-        let now = Date()
         let candidates = manual ? allCandidates : allCandidates.filter {
-            !handledWindows.contains($0.identity)
+            handledWindows[$0.identity] == nil
                 && (retryAfter[$0.identity] ?? .distantPast) <= now
         }
         guard !candidates.isEmpty else {
@@ -228,7 +230,7 @@ final class BridgeModel: ObservableObject {
 
         let target: BrowserAutofill.Target
         do {
-            target = try browserAutofill.locateTarget(candidates: candidates)
+            target = try await locateTargetAfterAccessibilityWarmup(candidates: candidates)
         } catch {
             scheduleRetry(for: candidates.map(\.identity))
             if manual { statusText = error.localizedDescription }
@@ -251,7 +253,10 @@ final class BridgeModel: ObservableObject {
             if manual { statusText = "未发现有效的 Apple 密码验证码窗口" }
             return
         }
-        guard manual || code.value != lastSuccessfulCode else {
+        let isRecentlyFilledCode = lastSuccessfulCode.map {
+            $0.value == code.value && $0.isFresh(at: now)
+        } ?? false
+        guard manual || !isRecentlyFilledCode else {
             markHandled(target.identity)
             return
         }
@@ -259,7 +264,11 @@ final class BridgeModel: ObservableObject {
         do {
             statusText = "已识别验证码，正在激活 \(target.application.localizedName ?? "目标应用")"
             try await browserAutofill.fill(code: code.value, target: target, speed: fillSpeed)
-            lastSuccessfulCode = code.value
+            lastSuccessfulCode = CapturedCode(
+                value: code.value,
+                capturedAt: Date(),
+                source: code.source
+            )
             currentCode = nil
             markHandled(target.identity)
             statusText = "已填入 \(target.application.localizedName ?? "目标应用")（\(code.source.rawValue)）"
@@ -267,6 +276,24 @@ final class BridgeModel: ObservableObject {
             scheduleRetry(for: [target.identity])
             statusText = error.localizedDescription
         }
+    }
+
+    private func locateTargetAfterAccessibilityWarmup(
+        candidates: [BrowserAutofill.Candidate]
+    ) async throws -> BrowserAutofill.Target {
+        browserAutofill.prepareAccessibility(for: candidates)
+
+        let retryDelays: [UInt64] = [120, 160, 220, 300, 400]
+        var lastError: Error = AutofillFailure.authorizationWindowNotFound
+        for delayMilliseconds in retryDelays {
+            try await Task.sleep(nanoseconds: delayMilliseconds * 1_000_000)
+            do {
+                return try browserAutofill.locateTarget(candidates: candidates)
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError
     }
 
     private func scheduleRetry(for identities: [BrowserAutofill.WindowIdentity]) {
@@ -280,7 +307,7 @@ final class BridgeModel: ObservableObject {
     }
 
     private func markHandled(_ identity: BrowserAutofill.WindowIdentity) {
-        handledWindows.insert(identity)
+        handledWindows[identity] = Date()
         retryAfter.removeValue(forKey: identity)
         failedAttempts.removeValue(forKey: identity)
     }
